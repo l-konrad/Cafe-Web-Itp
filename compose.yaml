@@ -1,0 +1,170 @@
+# Cafe website: Vvveb CMS + MySQL + dev nginx.
+# Spring Boot (run from IntelliJ) starts this file automatically; `docker compose up -d` works too.
+#
+# Start order on every `up`:
+#   1. db       MySQL, until healthy
+#   2. install  first time: downloads + installs the CMS with the settings from .env
+#               every time: makes sure the admin is at /ADMIN_PATH/ and applies VVVEB_DEV
+#   3. php      the CMS itself, only after install finished successfully
+#               -> the browser installer can never appear
+#   4. nginx    dev front door on port 8000: / -> CMS, /api/ -> Spring (like on the server)
+#
+# Settings: copy .env.example to .env and fill in the values.
+# Site:  http://localhost:8000  (CMS alone: http://localhost:9000)
+# Admin: http://localhost:8000/<ADMIN_PATH>/   (default: cafe-admin)
+
+services:
+
+  db:
+    image: mysql:latest            # pin to your running version: docker compose exec db mysql --version
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: ${DB_ROOT_PASSWORD:-vvveb}
+      MYSQL_DATABASE: vvveb
+      MYSQL_USER: vvveb
+      MYSQL_PASSWORD: ${DB_PASSWORD:-vvveb}
+    volumes:
+      - db:/var/lib/mysql
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -uvvveb -p$$MYSQL_PASSWORD --silent"]
+      interval: 5s
+      timeout: 5s
+      retries: 30
+    labels:
+      org.springframework.boot.ignore: true     # Spring must not connect its own DataSource to this DB
+
+  install:
+    image: vvveb/vvvebcms:latest
+    restart: "no"
+    working_dir: /var/www/html
+    volumes:
+      - vvveb-volume:/var/www/html
+      - ./cms/themes/cafe:/var/www/html/public/themes/cafe
+    depends_on:
+      db:
+        condition: service_healthy
+    networks:
+      - internal
+    environment:
+      VVVEB_DEV: ${VVVEB_DEV:-false}
+      DB_PASSWORD: ${DB_PASSWORD:-vvveb}
+      ADMIN_PATH: ${ADMIN_PATH:-cafe-admin}
+      SITE_NAME: ${SITE_NAME:-Cafe}
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-admin@example.com}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-change-me}
+      VVVEB_ZIP_URL: ${VVVEB_ZIP_URL:-https://www.vvveb.com/download.php}
+    # $$ = a literal $ for the shell inside the container, not for Docker Compose
+    entrypoint:
+      - sh
+      - -c
+      - |
+        cd /var/www/html
+
+        # 1. Install once (config/db.php exists = already installed)
+        if [ ! -f config/db.php ]; then
+          # The image does not contain the CMS, it has to be downloaded once.
+          if [ ! -f cli.php ]; then
+            echo "Downloading Vvveb CMS from $$VVVEB_ZIP_URL"
+            curl -fLo /tmp/vvveb.zip "$$VVVEB_ZIP_URL" || exit 1
+            unzip -oq /tmp/vvveb.zip -d /var/www/html || exit 1
+            rm -f /tmp/vvveb.zip
+          fi
+
+          echo "Installing Vvveb CMS"
+          php cli.php install module=index engine=mysqli host=db database=vvveb user=vvveb \
+            "password=$$DB_PASSWORD" \
+            noimport=1 noecommerce=1 theme=cafe homepage=index.html \
+            "settings[description][1][title]=$$SITE_NAME" \
+            "admin[email]=$$ADMIN_EMAIL" \
+            "admin[password]=$$ADMIN_PASSWORD"
+
+          if [ ! -f config/db.php ]; then
+            echo "Installation FAILED - see the output above."
+            exit 1
+          fi
+        else
+          echo "Vvveb is already installed."
+        fi
+
+        # 2. Fixed admin address (runs every time, does nothing if already done).
+        #    Vvveb names the admin folder randomly (public/vadmin-xxxx) and stores that
+        #    name in its config (admin.path). Rename the folder and update the config.
+        if [ ! -d "public/$$ADMIN_PATH" ]; then
+          for d in public/vadmin*; do
+            if [ -d "$$d" ]; then
+              old=$$(basename "$$d")
+              echo "Moving admin from /$$old/ to /$$ADMIN_PATH/"
+              mv "$$d" "public/$$ADMIN_PATH" || exit 1
+              php -r 'foreach (glob("config/*.php") as $$f) { $$c = file_get_contents($$f); if (strpos($$c, $$argv[1]) !== false) { file_put_contents($$f, str_replace($$argv[1], $$argv[2], $$c)); } }' "$$old" "$$ADMIN_PATH"
+              break
+            fi
+          done
+        fi
+
+        # 3. Development mode (VVVEB_DEV=true in .env): show errors, no page cache.
+        #    Production (VVVEB_DEV unset or false): errors hidden, page cache on.
+        if [ "$$VVVEB_DEV" = "true" ]; then
+          echo "Development mode: debug on, page cache off"
+          sed -i "s/define('DEBUG', false)/define('DEBUG', true)/; s/define('PAGE_CACHE', true)/define('PAGE_CACHE', false)/" env.php
+          rm -rf public/page-cache/*
+        else
+          echo "Production mode: debug off, page cache on"
+          sed -i "s/define('DEBUG', true)/define('DEBUG', false)/; s/define('PAGE_CACHE', false)/define('PAGE_CACHE', true)/" env.php
+        fi
+
+        # 4. Files created as root above must belong to the web server user (UID 1000).
+        mkdir -p storage/logs && touch storage/logs/error_log
+        chown -R www-data:www-data /var/www/html
+
+        echo "Ready. Admin: /$$ADMIN_PATH/"
+    labels:
+      org.springframework.boot.ignore: true
+
+  php:
+    image: vvveb/vvvebcms:latest   # pin a version tag once things work
+    restart: unless-stopped
+    environment:
+      DB_ENGINE: mysqli
+      DB_HOST: db
+      DB_DATABASE: vvveb
+      DB_USER: vvveb
+      DB_PASSWORD: ${DB_PASSWORD:-vvveb}
+    volumes:
+      - vvveb-volume:/var/www/html                              # CMS code, config, uploads (managed by Docker)
+      - ./cms/themes/cafe:/var/www/html/public/themes/cafe      # your theme (from Git)
+    ports:
+      - "127.0.0.1:9000:80"        # only reachable from this computer
+    depends_on:
+      db:
+        condition: service_healthy
+      install:
+        condition: service_completed_successfully   # never start before the CMS is installed
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "test -f /var/www/html/config/db.php"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    labels:
+      org.springframework.boot.ignore: true
+
+  nginx:
+    image: nginx:stable
+    network_mode: host             # listens on localhost:8000, reaches the CMS (9000) and Spring (8080)
+    volumes:
+      - ./dev/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      php:
+        condition: service_healthy
+    labels:
+      org.springframework.boot.readiness-check.tcp.disable: true
+
+volumes:
+  db:
+  vvveb-volume:
+
+networks:
+  internal:
